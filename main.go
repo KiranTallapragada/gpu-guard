@@ -12,6 +12,9 @@ import (
 	"io"
 	"math"
 	"os"
+	"os/signal"
+	"strings"
+	"syscall"
 	"time"
 )
 
@@ -22,6 +25,8 @@ const usage = `gpu-guard: is the model really running on the GPU?
 Usage:
   gpu-guard check     [flags]   one check; exit 0 healthy, 1 unhealthy (for Docker/Kubernetes)
   gpu-guard calibrate [flags]   measure a healthy server and suggest --min-tps
+  gpu-guard watch     [flags]   check on a schedule; after repeated failures run your
+                                recovery commands in order (rate-limited, JSON log)
   gpu-guard version
 
 Run "gpu-guard <command> -h" for the flags.
@@ -96,6 +101,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return cmdCheck(args[1:], stdout, stderr)
 	case "calibrate":
 		return cmdCalibrate(args[1:], stdout, stderr)
+	case "watch":
+		return cmdWatch(args[1:], stdout, stderr)
 	case "version", "--version", "-v":
 		fmt.Fprintln(stdout, "gpu-guard", version)
 		return 0
@@ -107,32 +114,52 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return 2
 }
 
+// checkFlags are shared by "check" and "watch", so both validate the same way.
+type checkFlags struct {
+	c        common
+	minTPS   *float64
+	ollama   *string
+	minShare *float64
+}
+
+func addCheckFlags(fs *flag.FlagSet) *checkFlags {
+	cf := &checkFlags{}
+	addCommon(fs, &cf.c)
+	cf.minTPS = fs.Float64("min-tps", 0, "fail below this many tokens/s (get a value from 'gpu-guard calibrate')")
+	cf.ollama = fs.String("ollama", "", "also check Ollama's GPU placement, e.g. http://localhost:11434")
+	cf.minShare = fs.Float64("min-gpu-share", 1.0, "Ollama: share of each model that must be in GPU memory (0-1)")
+	return cf
+}
+
+func (cf *checkFlags) config(fs *flag.FlagSet) (CheckConfig, error) {
+	if err := cf.c.validate(fs); err != nil {
+		return CheckConfig{}, err
+	}
+	if !finite(*cf.minTPS) || *cf.minTPS < 0 || !finite(*cf.minShare) || *cf.minShare < 0 || *cf.minShare > 1 {
+		return CheckConfig{}, errors.New("--min-tps must be a number >= 0 and --min-gpu-share between 0 and 1")
+	}
+	if *cf.minTPS <= 0 && (*cf.ollama == "" || *cf.minShare <= 0) {
+		return CheckConfig{}, errors.New("set --min-tps (run 'gpu-guard calibrate' first) and/or --ollama with --min-gpu-share above 0")
+	}
+	return CheckConfig{Probe: cf.c.probe(), MinTPS: *cf.minTPS, MinTokens: 8, OllamaURL: *cf.ollama, MinGPUShare: *cf.minShare}, nil
+}
+
 func cmdCheck(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("check", flag.ContinueOnError)
 	fs.SetOutput(stderr)
-	var c common
-	addCommon(fs, &c)
-	minTPS := fs.Float64("min-tps", 0, "fail below this many tokens/s (get a value from 'gpu-guard calibrate')")
-	ollama := fs.String("ollama", "", "also check Ollama's GPU placement, e.g. http://localhost:11434")
-	minShare := fs.Float64("min-gpu-share", 1.0, "Ollama: share of each model that must be in GPU memory (0-1)")
+	cf := addCheckFlags(fs)
 	if code, done := parseArgs(fs, args); done {
 		return code
 	}
-	if err := c.validate(fs); err != nil {
+	cfg, err := cf.config(fs)
+	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	if !finite(*minTPS) || *minTPS < 0 || !finite(*minShare) || *minShare < 0 || *minShare > 1 {
-		fmt.Fprintln(stderr, "--min-tps must be a number >= 0 and --min-gpu-share between 0 and 1")
-		return 2
-	}
-	if *minTPS <= 0 && (*ollama == "" || *minShare <= 0) {
-		fmt.Fprintln(stderr, "set --min-tps (run 'gpu-guard calibrate' first) and/or --ollama with --min-gpu-share above 0")
-		return 2
-	}
+	c := cf.c
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout+10*time.Second)
 	defer cancel()
-	res := Check(ctx, CheckConfig{Probe: c.probe(), MinTPS: *minTPS, MinTokens: 8, OllamaURL: *ollama, MinGPUShare: *minShare})
+	res := Check(ctx, cfg)
 
 	if c.jsonOut {
 		enc := json.NewEncoder(stdout)
@@ -156,6 +183,60 @@ func cmdCheck(args []string, stdout, stderr io.Writer) int {
 	if res.Status != Healthy {
 		return 1
 	}
+	return 0
+}
+
+// stepList collects repeated --on-fail flags in order.
+type stepList []string
+
+func (s *stepList) String() string     { return strings.Join(*s, "; ") }
+func (s *stepList) Set(v string) error { *s = append(*s, v); return nil }
+
+func cmdWatch(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cf := addCheckFlags(fs)
+	var steps stepList
+	fs.Var(&steps, "on-fail", "recovery command, repeat for each step in order, mildest first (run with /bin/sh -c)")
+	failures := fs.Int("failures", 3, "consecutive failed checks before a recovery step")
+	interval := fs.Duration("interval", 2*time.Minute, "time between checks")
+	settle := fs.Duration("settle", 3*time.Minute, "wait after a recovery step before checking again")
+	cooldown := fs.Duration("cooldown", 10*time.Minute, "minimum time between recovery steps")
+	maxPerHour := fs.Int("max-per-hour", 3, "most recovery steps in any rolling hour (0 = no limit)")
+	stepTimeout := fs.Duration("step-timeout", 5*time.Minute, "time limit for one recovery command")
+	dryRun := fs.Bool("dry-run", false, "log the recovery steps that would run, without running them")
+	if code, done := parseArgs(fs, args); done {
+		return code
+	}
+	cfg, err := cf.config(fs)
+	if err != nil {
+		fmt.Fprintln(stderr, err)
+		return 2
+	}
+	if *failures < 1 || *interval <= 0 || *settle < 0 || *cooldown < 0 || *maxPerHour < 0 || *stepTimeout <= 0 {
+		fmt.Fprintln(stderr, "--failures must be >= 1; --interval and --step-timeout positive; others not negative")
+		return 2
+	}
+	for _, s := range steps {
+		if strings.TrimSpace(s) == "" {
+			fmt.Fprintln(stderr, "--on-fail commands must not be empty")
+			return 2
+		}
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	timeout := cf.c.timeout + 10*time.Second
+	w := &Watcher{
+		Check: func(ctx context.Context) CheckResult {
+			cctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			return Check(cctx, cfg)
+		},
+		Steps: steps, Failures: *failures, Interval: *interval, Settle: *settle, Cooldown: *cooldown,
+		MaxPerHour: *maxPerHour, StepTimeout: *stepTimeout, DryRun: *dryRun,
+		Log: stdout, Now: time.Now, Sleep: sleepCtx, RunStep: shellStep,
+	}
+	w.Run(ctx)
 	return 0
 }
 
