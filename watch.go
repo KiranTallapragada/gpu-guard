@@ -150,6 +150,7 @@ func shellStep(ctx context.Context, cmd string) (string, error) {
 	var out capped
 	c.Stdout, c.Stderr = &out, &out
 	err := c.Run()
+	cleanupGroup(c) // nothing it started outlives the step
 	return out.String(), err
 }
 

@@ -223,7 +223,7 @@ func cmdWatch(args []string, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP, syscall.SIGQUIT)
 	defer stop()
 	timeout := cf.c.timeout + 10*time.Second
 	w := &Watcher{

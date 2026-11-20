@@ -89,7 +89,9 @@ gpu-guard watch --url http://localhost:8000/v1 --min-tps 30 \
 - **Safety limits:** at most one step per `--cooldown` (default 10 minutes) and `--max-per-hour`
   (default 3), so a persistent fault can't cause a storm of restarts. Each command runs in its own
   process group and is stopped, along with anything it started, after `--step-timeout` (default
-  5 minutes) or when `watch` is stopped. Output kept per command is capped at 64 KiB.
+  5 minutes) or when `watch` is stopped. Anything a command leaves running in the background is
+  cleaned up when it finishes, so restart services through systemd or Docker (`systemctl restart …`,
+  `docker restart …`) rather than starting them with `&`. Output kept per command is capped at 64 KiB.
 - **Try it first:** `--dry-run` logs what would run without running anything.
 - **Log:** one JSON line per event (`healthy`, `unhealthy`, `action`, `action_failed`, `held`,
   `dry_run`) on standard output, ready for any log collector.
