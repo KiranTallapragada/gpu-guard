@@ -162,9 +162,10 @@ func TestAPIKeyFromEnvironmentIsSent(t *testing.T) {
 }
 
 func TestRedirectsAreNotFollowed(t *testing.T) {
-	var leaked bool
+	var hits int
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		leaked = r.Header.Get("Authorization") != ""
+		hits++
+		_, _ = w.Write([]byte(`{"usage":{"completion_tokens":64}}`))
 	}))
 	defer target.Close()
 	redir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -173,8 +174,8 @@ func TestRedirectsAreNotFollowed(t *testing.T) {
 	defer redir.Close()
 	c := cfg(redir.URL, 1)
 	c.Probe.Model, c.Probe.APIKey = "m", "sk-x"
-	if res := Check(context.Background(), c); res.Status != Unhealthy || leaked {
-		t.Fatalf("status %v, key forwarded: %v", res.Status, leaked)
+	if res := Check(context.Background(), c); res.Status != Unhealthy || hits != 0 {
+		t.Fatalf("status %v, redirect target contacted %d times", res.Status, hits)
 	}
 }
 
@@ -210,5 +211,39 @@ func TestCalibrateRejectsTooFewTokens(t *testing.T) {
 	var out, errb bytes.Buffer
 	if code := run([]string{"calibrate", "--url", s.URL + "/v1", "--runs", "2"}, &out, &errb); code != 1 {
 		t.Fatalf("exit %d", code)
+	}
+}
+
+func TestExplicitEmptyAPIKeySendsNoKey(t *testing.T) {
+	t.Setenv("GPU_GUARD_API_KEY", "sk-env")
+	var got string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte(`{"usage":{"completion_tokens":64}}`))
+	}))
+	defer s.Close()
+	var out, errb bytes.Buffer
+	run([]string{"check", "--url", s.URL + "/v1", "--model", "m", "--min-tps", "1", "--api-key="}, &out, &errb)
+	if got != "" {
+		t.Fatalf("Authorization = %q, want none", got)
+	}
+}
+
+func TestEchoedKeyIsRedactedInErrors(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "invalid key "+strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "), http.StatusUnauthorized)
+	}))
+	defer s.Close()
+	var out, errb bytes.Buffer
+	code := run([]string{"check", "--url", s.URL + "/v1", "--model", "m", "--min-tps", "1", "--api-key", "sk-echo-123"}, &out, &errb)
+	if code != 1 || strings.Contains(out.String()+errb.String(), "sk-echo-123") {
+		t.Fatalf("exit %d, output: %s", code, out.String())
+	}
+}
+
+func TestOllamaOnlyNeedsPositiveShare(t *testing.T) {
+	var out, errb bytes.Buffer
+	if code := run([]string{"check", "--ollama", "http://x", "--min-gpu-share", "0"}, &out, &errb); code != 2 {
+		t.Fatalf("exit %d, want 2", code)
 	}
 }

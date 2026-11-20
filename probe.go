@@ -76,7 +76,11 @@ func (p *Probe) do(ctx context.Context, method, path string, body any, out any) 
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
-		return fmt.Errorf("%s %s: HTTP %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(msg)))
+		text := strings.TrimSpace(string(msg))
+		if p.APIKey != "" {
+			text = strings.ReplaceAll(text, p.APIKey, "[redacted]") // servers sometimes echo the key
+		}
+		return fmt.Errorf("%s %s: HTTP %d: %s", method, path, resp.StatusCode, text)
 	}
 	return json.NewDecoder(io.LimitReader(resp.Body, maxBody)).Decode(out)
 }

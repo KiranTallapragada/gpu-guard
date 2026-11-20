@@ -8,7 +8,8 @@ check stays green, but every request is many times slower.
 
 `gpu-guard` checks what matters: it sends a tiny fixed prompt and measures **tokens per second**
 against a threshold from your own healthy server. With Ollama it can also read how much of each
-loaded model is in GPU memory. It works with vLLM, Ollama or any OpenAI-compatible server, and
+loaded model is in GPU memory. It's designed for vLLM, Ollama and other servers with
+OpenAI-compatible `/models` and `/chat/completions` endpoints (real-server testing is pending), and
 it's a single binary with no dependencies.
 
 > **Status:** early (0.1, in development). Tested against simulated servers; real-GPU testing on
@@ -28,8 +29,9 @@ Suggested: gpu-guard check --url http://localhost:8000/v1 --model Qwen/Qwen3-8B 
 gpu-guard check --url http://localhost:8000/v1 --min-tps 30
 ```
 
-The numbers above are illustrative. The threshold is half your median healthy speed: normal
-variation stays above it, and a CPU fallback falls far below.
+The numbers above are illustrative. Half your median healthy speed is a starting threshold: check
+it under normal load, and lower it if busy periods trip it. A model running on the CPU is usually
+many times slower, but measure your own case.
 
 **Ollama:** add the placement check. After the probe, it fails if the probed model isn't loaded or
 any loaded model isn't fully in GPU memory:
@@ -39,8 +41,9 @@ gpu-guard check --url http://localhost:11434/v1 --ollama http://localhost:11434 
 ```
 
 Add `--json` to `check` for machine-readable output, and `--api-key` (or `GPU_GUARD_API_KEY`) if
-your server needs one. The key is never printed, and redirects are not followed, so it isn't sent
-anywhere except the URL you give.
+your server needs one. The key is not printed (it's redacted if a server echoes it in an error),
+and redirects are not followed, so it isn't sent anywhere except the URL you give. Pass
+`--api-key=` to send no key even when the environment variable is set.
 
 ## As a health check
 

@@ -29,6 +29,7 @@ Run "gpu-guard <command> -h" for the flags.
 
 type common struct {
 	url, model, apiKey string
+	apiKeySet          bool // --api-key given explicitly (even as empty: then no key is sent)
 	maxTokens          int
 	timeout            time.Duration
 	jsonOut            bool
@@ -45,14 +46,19 @@ func addCommon(fs *flag.FlagSet, c *common) {
 
 func (c common) probe() Probe {
 	key := c.apiKey
-	if key == "" {
+	if !c.apiKeySet {
 		key = os.Getenv("GPU_GUARD_API_KEY") // read after parsing, so it never appears in help output
 	}
 	return Probe{BaseURL: c.url, Model: c.model, APIKey: key, MaxTokens: c.maxTokens, Timeout: c.timeout}
 }
 
 // validate rejects settings that would make a check meaningless.
-func (c common) validate(fs *flag.FlagSet) error {
+func (c *common) validate(fs *flag.FlagSet) error {
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "api-key" {
+			c.apiKeySet = true
+		}
+	})
 	if fs.NArg() > 0 {
 		return fmt.Errorf("unexpected argument %q (flags go before nothing else)", fs.Arg(0))
 	}
@@ -120,8 +126,8 @@ func cmdCheck(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "--min-tps must be a number >= 0 and --min-gpu-share between 0 and 1")
 		return 2
 	}
-	if *minTPS <= 0 && *ollama == "" {
-		fmt.Fprintln(stderr, "set --min-tps (run 'gpu-guard calibrate' first) and/or --ollama")
+	if *minTPS <= 0 && (*ollama == "" || *minShare <= 0) {
+		fmt.Fprintln(stderr, "set --min-tps (run 'gpu-guard calibrate' first) and/or --ollama with --min-gpu-share above 0")
 		return 2
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.timeout+10*time.Second)
