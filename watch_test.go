@@ -124,9 +124,10 @@ func TestHourlyCapAndLastStepRepeats(t *testing.T) {
 		t.Fatalf("missing hold reason")
 	}
 	clk.advance(time.Hour)
+	before := len(ran)
 	w.Tick(ctx)
-	if ran[len(ran)-1] != "alert" {
-		t.Fatalf("after the last step it should repeat the strongest step, got %v", ran)
+	if len(ran) != before+1 || ran[len(ran)-1] != "alert" {
+		t.Fatalf("after the last step a new run of the strongest step is expected, got %v", ran)
 	}
 }
 
@@ -205,8 +206,14 @@ func TestWatchEndToEndRunsRealStepsInOrder(t *testing.T) {
 		MaxPerHour: 3, StepTimeout: 5 * time.Second,
 		Log: log, Now: time.Now, Sleep: sleepCtx, RunStep: shellStep,
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second) // watchdog only
 	defer cancel()
+	w.Sleep = func(ctx context.Context, d time.Duration) bool {
+		if strings.Contains(log.String(), "hourly limit reached") {
+			cancel() // done: three actions ran and the cap held the next one
+		}
+		return sleepCtx(ctx, d)
+	}
 	w.Run(ctx)
 	b, _ := os.ReadFile(marker)
 	got := strings.Fields(string(b))
@@ -215,5 +222,69 @@ func TestWatchEndToEndRunsRealStepsInOrder(t *testing.T) {
 	}
 	if !strings.Contains(log.String(), "hourly limit reached") {
 		t.Fatalf("expected the hourly cap to hold further steps")
+	}
+}
+
+func TestCooldownLongerThanAnHourHolds(t *testing.T) {
+	health := make([]bool, 10)
+	var ran []string
+	w, clk, log := newTestWatcher(&health, &ran)
+	w.Failures, w.Cooldown, w.MaxPerHour = 1, 2*time.Hour, 0
+	ctx := context.Background()
+	w.Tick(ctx)
+	clk.advance(61 * time.Minute)
+	w.Tick(ctx)
+	if len(ran) != 1 || !strings.Contains(log.String(), `"note":"cooldown"`) {
+		t.Fatalf("2h cooldown must still hold after 61 minutes: ran %v", ran)
+	}
+	clk.advance(60 * time.Minute)
+	w.Tick(ctx)
+	if len(ran) != 2 {
+		t.Fatalf("cooldown over, a second step was expected: %v", ran)
+	}
+}
+
+func TestCancelledCheckIsNotAFailure(t *testing.T) {
+	health := []bool{false, false}
+	var ran []string
+	w, _, log := newTestWatcher(&health, &ran)
+	w.Failures = 1
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	w.Tick(ctx)
+	if len(ran) != 0 || log.Len() != 0 {
+		t.Fatalf("a cancelled tick must log and run nothing: ran %v, log %q", ran, log.String())
+	}
+}
+
+func TestRunWaitsIntervalOrSettle(t *testing.T) {
+	health := []bool{true, false, false, false}
+	var ran []string
+	w, _, _ := newTestWatcher(&health, &ran)
+	var waits []time.Duration
+	w.Sleep = func(_ context.Context, d time.Duration) bool {
+		waits = append(waits, d)
+		return len(health) > 0
+	}
+	w.Run(context.Background())
+	// healthy -> interval; failure 1 -> interval; failure 2 -> action -> settle; failure -> interval
+	want := []time.Duration{time.Minute, time.Minute, 3 * time.Minute, time.Minute}
+	if len(waits) != len(want) {
+		t.Fatalf("waits %v, want %v", waits, want)
+	}
+	for i := range want {
+		if waits[i] != want[i] {
+			t.Fatalf("wait %d = %v, want %v (all: %v)", i, waits[i], want[i], waits)
+		}
+	}
+}
+
+func TestStepOutputIsCapped(t *testing.T) {
+	out, err := shellStep(context.Background(), "head -c 1000000 /dev/zero | tr '\\0' x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) > maxStepOutput+64 || !strings.HasSuffix(out, "[output truncated]") {
+		t.Fatalf("output not capped: %d bytes", len(out))
 	}
 }

@@ -82,12 +82,14 @@ gpu-guard watch --url http://localhost:8000/v1 --min-tps 30 \
   --on-fail "/usr/local/bin/page-oncall 'GPU still degraded'"
 ```
 
-- **Escalation:** after `--failures` (default 3) failed checks it runs step 1; if the server is still
-  unhealthy after `--settle`, step 2, and so on. The last step repeats if needed. One healthy check
-  resets everything to step 1.
+- **Escalation:** after `--failures` (default 3) failed checks in a row it runs step 1, waits
+  `--settle`, and starts counting again. Another `--failures` failures in a row run step 2, and so
+  on; once the last step is reached it repeats. A healthy check resets the escalation to step 1
+  (the cooldown and hourly limit still apply).
 - **Safety limits:** at most one step per `--cooldown` (default 10 minutes) and `--max-per-hour`
-  (default 3), so a persistent fault can't cause a storm of restarts. Each command is stopped after
-  `--step-timeout` (default 5 minutes).
+  (default 3), so a persistent fault can't cause a storm of restarts. Each command runs in its own
+  process group and is stopped, along with anything it started, after `--step-timeout` (default
+  5 minutes) or when `watch` is stopped. Output kept per command is capped at 64 KiB.
 - **Try it first:** `--dry-run` logs what would run without running anything.
 - **Log:** one JSON line per event (`healthy`, `unhealthy`, `action`, `action_failed`, `held`,
   `dry_run`) on standard output, ready for any log collector.
