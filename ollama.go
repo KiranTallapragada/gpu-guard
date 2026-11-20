@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 )
@@ -40,7 +41,7 @@ func OllamaLoaded(ctx context.Context, client *http.Client, baseURL string) ([]O
 	var body struct {
 		Models []OllamaModel `json:"models"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, maxBody)).Decode(&body); err != nil {
 		return nil, err
 	}
 	return body.Models, nil

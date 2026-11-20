@@ -36,8 +36,21 @@ func (p *Probe) client() *http.Client {
 	if p.Client != nil {
 		return p.Client
 	}
-	return &http.Client{Timeout: p.Timeout}
+	return newClient(p.Timeout)
 }
+
+// newClient never follows redirects, so an API key can't be forwarded to another host.
+func newClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// maxBody caps how much of a response we read.
+const maxBody = 1 << 20
 
 func (p *Probe) do(ctx context.Context, method, path string, body any, out any) error {
 	var rd io.Reader
@@ -65,7 +78,7 @@ func (p *Probe) do(ctx context.Context, method, path string, body any, out any) 
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
 		return fmt.Errorf("%s %s: HTTP %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
-	return json.NewDecoder(resp.Body).Decode(out)
+	return json.NewDecoder(io.LimitReader(resp.Body, maxBody)).Decode(out)
 }
 
 func (p *Probe) firstModel(ctx context.Context) (string, error) {

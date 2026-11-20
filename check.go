@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"sort"
+	"strings"
 )
 
 type Status string
@@ -35,9 +36,23 @@ func (r *CheckResult) fail(format string, a ...any) {
 	r.Reasons = append(r.Reasons, fmt.Sprintf(format, a...))
 }
 
-// Check runs the speed probe and, when configured, Ollama's GPU-placement check.
+// Check runs the speed probe first (so the model is loaded), then, when configured, Ollama's
+// GPU-placement check for the model that was probed.
 func Check(ctx context.Context, c CheckConfig) CheckResult {
 	res := CheckResult{Status: Healthy}
+
+	pr, err := c.Probe.Run(ctx)
+	if err != nil {
+		res.fail("probe request failed: %v", err)
+	} else {
+		res.Probe = &pr
+		switch {
+		case pr.CompletionTokens < c.MinTokens:
+			res.fail("only %d tokens generated; too few to measure speed (raise --max-tokens or check the model)", pr.CompletionTokens)
+		case c.MinTPS > 0 && pr.TokensPerSecond < c.MinTPS:
+			res.fail("%.1f tokens/s is below the minimum of %.1f (possible CPU fallback or a degraded GPU)", pr.TokensPerSecond, c.MinTPS)
+		}
+	}
 
 	if c.OllamaURL != "" {
 		client := c.OllamaClient
@@ -45,29 +60,26 @@ func Check(ctx context.Context, c CheckConfig) CheckResult {
 			client = c.Probe.client()
 		}
 		models, err := OllamaLoaded(ctx, client, c.OllamaURL)
-		if err != nil {
+		switch {
+		case err != nil:
 			res.fail("could not read Ollama model placement: %v", err)
-		} else {
+		case len(models) == 0:
+			res.fail("Ollama reports no loaded model after the probe")
+		default:
 			res.Ollama = models
+			probed := false
 			for _, m := range models {
+				if res.Probe != nil && (m.Name == res.Probe.Model || strings.TrimSuffix(m.Name, ":latest") == res.Probe.Model) {
+					probed = true
+				}
 				if share := m.GPUShare(); share < c.MinGPUShare {
 					res.fail("%s: only %.0f%% of the model is in GPU memory (CPU fallback)", m.Name, share*100)
 				}
 			}
+			if res.Probe != nil && !probed {
+				res.fail("the probed model %q is not in Ollama's loaded list", res.Probe.Model)
+			}
 		}
-	}
-
-	pr, err := c.Probe.Run(ctx)
-	if err != nil {
-		res.fail("probe request failed: %v", err)
-		return res
-	}
-	res.Probe = &pr
-	switch {
-	case pr.CompletionTokens < c.MinTokens:
-		res.fail("only %d tokens generated; too few to measure speed (raise --max-tokens or check the model)", pr.CompletionTokens)
-	case c.MinTPS > 0 && pr.TokensPerSecond < c.MinTPS:
-		res.fail("%.1f tokens/s is below the minimum of %.1f (possible CPU fallback or a degraded GPU)", pr.TokensPerSecond, c.MinTPS)
 	}
 	return res
 }

@@ -72,7 +72,7 @@ func TestUnreachableServerIsUnhealthy(t *testing.T) {
 }
 
 func TestOllamaCPUFallbackDetected(t *testing.T) {
-	s := fakeServer(t, 64, 0, `{"models":[{"name":"qwen3:8b","size":6000000000,"size_vram":0}]}`)
+	s := fakeServer(t, 64, 0, `{"models":[{"name":"test-model","size":6000000000,"size_vram":0}]}`)
 	c := cfg(s.URL, 0)
 	c.OllamaURL = s.URL
 	res := Check(context.Background(), c)
@@ -82,7 +82,7 @@ func TestOllamaCPUFallbackDetected(t *testing.T) {
 }
 
 func TestOllamaFullyOnGPUIsHealthy(t *testing.T) {
-	s := fakeServer(t, 64, 0, `{"models":[{"name":"qwen3:8b","size":6000000000,"size_vram":6000000000}]}`)
+	s := fakeServer(t, 64, 0, `{"models":[{"name":"test-model","size":6000000000,"size_vram":6000000000}]}`)
 	c := cfg(s.URL, 0)
 	c.OllamaURL = s.URL
 	if res := Check(context.Background(), c); res.Status != Healthy {
@@ -116,5 +116,99 @@ func TestCheckCommandExitCodes(t *testing.T) {
 	}
 	if code := run([]string{"check"}, &out, &errb); code != 2 {
 		t.Fatalf("missing thresholds should be a usage error, got %d", code)
+	}
+}
+
+func TestOllamaWrongOrEmptyModelListIsUnhealthy(t *testing.T) {
+	for name, ps := range map[string]string{
+		"other model loaded": `{"models":[{"name":"other:7b","size":1,"size_vram":1}]}`,
+		"nothing loaded":     `{"models":[]}`,
+	} {
+		s := fakeServer(t, 64, 0, ps)
+		c := cfg(s.URL, 0)
+		c.OllamaURL = s.URL
+		if res := Check(context.Background(), c); res.Status != Unhealthy {
+			t.Errorf("%s: got %+v", name, res)
+		}
+	}
+}
+
+func TestHelpExitsZeroAndNeverShowsTheAPIKey(t *testing.T) {
+	t.Setenv("GPU_GUARD_API_KEY", "sk-secret-value")
+	for _, cmd := range []string{"check", "calibrate"} {
+		var out, errb bytes.Buffer
+		if code := run([]string{cmd, "-h"}, &out, &errb); code != 0 {
+			t.Errorf("%s -h: exit %d", cmd, code)
+		}
+		if strings.Contains(out.String()+errb.String(), "sk-secret-value") {
+			t.Errorf("%s -h printed the API key", cmd)
+		}
+	}
+}
+
+func TestAPIKeyFromEnvironmentIsSent(t *testing.T) {
+	t.Setenv("GPU_GUARD_API_KEY", "sk-env")
+	var got string
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte(`{"usage":{"completion_tokens":64}}`))
+	}))
+	defer s.Close()
+	var out, errb bytes.Buffer
+	run([]string{"check", "--url", s.URL + "/v1", "--model", "m", "--min-tps", "1"}, &out, &errb)
+	if got != "Bearer sk-env" {
+		t.Fatalf("Authorization = %q", got)
+	}
+}
+
+func TestRedirectsAreNotFollowed(t *testing.T) {
+	var leaked bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked = r.Header.Get("Authorization") != ""
+	}))
+	defer target.Close()
+	redir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer redir.Close()
+	c := cfg(redir.URL, 1)
+	c.Probe.Model, c.Probe.APIKey = "m", "sk-x"
+	if res := Check(context.Background(), c); res.Status != Unhealthy || leaked {
+		t.Fatalf("status %v, key forwarded: %v", res.Status, leaked)
+	}
+}
+
+func TestInvalidThresholdsAreUsageErrors(t *testing.T) {
+	for _, args := range [][]string{
+		{"check", "--min-tps", "NaN"},
+		{"check", "--min-tps", "-5"},
+		{"check", "--min-tps", "10", "--min-gpu-share", "2"},
+		{"check", "--min-tps", "10", "--max-tokens", "2"},
+		{"check", "--min-tps", "10", "stray"},
+		{"calibrate", "--runs", "1"},
+	} {
+		var out, errb bytes.Buffer
+		if code := run(args, &out, &errb); code != 2 {
+			t.Errorf("%v: exit %d, want 2", args, code)
+		}
+	}
+}
+
+func TestCalibrateSuggestsAThreshold(t *testing.T) {
+	s := fakeServer(t, 64, 20*time.Millisecond, "")
+	var out, errb bytes.Buffer
+	if code := run([]string{"calibrate", "--url", s.URL + "/v1", "--runs", "3"}, &out, &errb); code != 0 {
+		t.Fatalf("exit %d: %s", code, errb.String())
+	}
+	if !strings.Contains(out.String(), "--min-tps") || !strings.Contains(out.String(), "test-model") {
+		t.Fatalf("output: %s", out.String())
+	}
+}
+
+func TestCalibrateRejectsTooFewTokens(t *testing.T) {
+	s := fakeServer(t, 2, 0, "")
+	var out, errb bytes.Buffer
+	if code := run([]string{"calibrate", "--url", s.URL + "/v1", "--runs", "2"}, &out, &errb); code != 1 {
+		t.Fatalf("exit %d", code)
 	}
 }

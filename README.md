@@ -31,14 +31,16 @@ gpu-guard check --url http://localhost:8000/v1 --min-tps 30
 The numbers above are illustrative. The threshold is half your median healthy speed: normal
 variation stays above it, and a CPU fallback falls far below.
 
-**Ollama:** add the placement check, which fails when any loaded model is not fully in GPU memory:
+**Ollama:** add the placement check. After the probe, it fails if the probed model isn't loaded or
+any loaded model isn't fully in GPU memory:
 
 ```
 gpu-guard check --url http://localhost:11434/v1 --ollama http://localhost:11434 --min-tps 20
 ```
 
-Add `--json` for machine-readable output, and `--api-key` (or `GPU_GUARD_API_KEY`) if your
-server needs one.
+Add `--json` to `check` for machine-readable output, and `--api-key` (or `GPU_GUARD_API_KEY`) if
+your server needs one. The key is never printed, and redirects are not followed, so it isn't sent
+anywhere except the URL you give.
 
 ## As a health check
 
